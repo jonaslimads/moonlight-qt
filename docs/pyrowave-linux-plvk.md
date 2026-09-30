@@ -81,25 +81,39 @@ none of the `PL_DEPRECATED` `pl_sync` / `pl_tex_export` API.
 * **decode -> render.** pyrowave signals a timeline `VkSemaphore` at value V. The
   app calls `pl_vulkan_release_ex()` with `{tex, layout, qf, semaphore = {sem, V}}`:
   "the semaphore to wait on before libplacebo will actually use or modify the
-  image". For planar textures that semaphore must be a timeline semaphore, which
-  is what we create.
+  image". That call returns `void`, because handing an image to libplacebo cannot
+  fail, so there is no error path to write here. For planar textures that semaphore
+  has to be a timeline one, which is what we create.
 * **render -> decode.** Before handing an image back to the codec, the app calls
-  `pl_vulkan_hold_ex()`, which returns a timeline value that fires once
-  libplacebo's reads are done. The decoder's existing `SurfaceFreeList` already
-  keys reuse on "release fence value not yet reached", so the Linux pool feeds
-  that same free list; a surface is only handed out once
-  `vkGetSemaphoreCounterValue` has passed its value. With a 10-deep pool that
-  check is non-blocking in practice, and it is the same discipline the D3D11 pool
-  uses with its NT fences.
+  `pl_vulkan_hold_ex()`, passing the timeline semaphore and value that should fire
+  once libplacebo's reads are done, and checking the `bool` it returns. The
+  decoder's existing `SurfaceFreeList` already keys reuse on "release fence value
+  not yet reached", so the Linux pool feeds that same free list.
 
-Timeline semaphores are created with `pl_vulkan_sem_create()` so that libplacebo
-shares the device's semaphore bookkeeping, and are handed to pyrowave as its
-`pyrowave_sync_object`s (`pyrowave_sync_object_get_semaphore()`).
+Each plane gets its own release value: signalling a Vulkan timeline semaphore twice
+with the same value is not legal, and a surface has three planes.
 
-When the decoder records into a caller-owned command buffer
-(`pyrowave_device_set_command_buffer()`) both its sync operations must be `NULL`,
-so ordering then comes from queue submission order, and the release edge above is
-what keeps the codec from overwriting a surface that is still being read.
+Ordering rule, and the reason the call sites are where they are: a release signal
+has to be recorded *after* the `vkQueueSubmit` that carried the reads, because
+libplacebo submits its drawing in `pl_swapchain_submit_frame()`, not while it
+records it. Signalling earlier would let the codec overwrite a surface that is still
+being sampled. So `PlVkRenderer::releasePyroWaveSurface()` runs at the end of
+`renderFrame()` and after every `submitPendingSwapchainFrame()` that succeeded -
+including the one that abandons a VRR frame, which was still drawn. Both run on the
+render thread, and the AVFrame owning the `PyroWaveFrameRef` has to still be alive
+there, since that is what the release value is written into. If a PyroWave stream
+ever shows torn or impossibly recycled surfaces, check that invariant first.
+
+The semaphores are plain `vkCreateSemaphore` calls with `VK_SEMAPHORE_TYPE_TIMELINE`
+on the shared device. Nothing is exported: `pyrowave_sync_point` takes a
+`VkSemaphore` and so does `pl_vulkan_sem`, so on one device both sides can use the
+same handle. `pyrowave_sync_object` is only needed on the Windows path, to pull an
+NT fence into the codec's device.
+
+The codec submits on plvk's own graphics queue, so it has to take libplacebo's queue
+lock, which `pl_vulkan_t::lock_queue` hands out; the pool passes it on as pyrowave's
+`queue_lock_callback`. Decoding happens on the decode thread and presenting on the
+render thread, so that lock is the only thing keeping them apart.
 
 ## What is shared with the decoder
 
@@ -165,3 +179,22 @@ kill the session if it fails.
 code runs: `tst_dualsensehaptics` fails deterministically here ("right leaks into
 left"). It is unrelated to this work and untouched by it. See
 `scripts/linux/README.md`.
+
+## Status of the Linux path
+
+Built and linked, with the whole test tree at its pre-existing baseline, but not
+yet seen running against a host. What that means in practice:
+
+* The colour path is unverified. `pl_frame_from_avframe()` supplies the colourimetry
+  and plane semantics, and this renderer only replaces the texture pointers, so a
+  mistake here shows up as a washed-out or crushed picture and nothing else. It has
+  to be looked at against the Windows build before the numbers are trusted.
+* `pyrowave_create_device()` has never been called on a Linux driver with a
+  libplacebo-made device. It validates itself against the create infos we
+  reconstruct from `pl_vulkan_t::extensions` and `::features`, so a mismatch will
+  surface as a device creation failure with a log line, not as silent corruption.
+* The round trip test decodes with CPU buffers, so it does not exercise the GPU
+  submit path, the timeline semaphores or the queue lock at all. Those need a real
+  stream, or a new test that decodes into images the way this code does.
+* Whether the host's bitstream ID matches `PYROWAVE_BITSTREAM_ID` decides whether a
+  stream starts at all; check the handshake log before debugging anything else.

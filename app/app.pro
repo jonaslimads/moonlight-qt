@@ -520,10 +520,17 @@ wayland {
     DEFINES += HAVE_H264BITSTREAM
 }
 
-# PyroWave decoding (Vulkan compute) presents through the D3D11 renderer, so it
-# is Windows-only for now. Granite has no MSVC ARM64 SIMD path.
+# PyroWave decoding is Vulkan compute; what makes it platform specific is the
+# renderer that has to share decoded surfaces with it. On Windows that is the
+# D3D11 renderer. On Linux it is plvk, libplacebo's Vulkan backend, which can
+# hand the codec its VkDevice outright - see docs/pyrowave-linux-plvk.md.
+# Granite has no MSVC ARM64 SIMD path, and nobody has tried macOS.
 win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
     message(PyroWave decoder enabled)
+    CONFIG += pyrowave
+}
+unix:!macx:contains(QT_ARCH, x86_64):libplacebo:!disable-pyrowave {
+    message(PyroWave decoder enabled via plvk)
     CONFIG += pyrowave
 }
 pyrowave {
@@ -536,6 +543,11 @@ pyrowave {
         streaming/video/pyrowave/pyrowavedecoder.h \
         streaming/video/pyrowave/pyrowaveframing.h \
         streaming/video/pyrowave/pyrowavesurfaces.h
+
+    libplacebo {
+        SOURCES += streaming/video/ffmpeg-renderers/plvkpyrowave.cpp
+        HEADERS += streaming/video/ffmpeg-renderers/plvkpyrowave.h
+    }
 
     # Only pyrowave.h is included from the vendored tree
     INCLUDEPATH += $$PWD/../pyrowave/pyrowave

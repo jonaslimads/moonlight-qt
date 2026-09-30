@@ -7,6 +7,40 @@
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
 
+#ifdef Q_OS_LINUX
+#include <dlfcn.h>
+
+namespace {
+
+// Whether this machine has a Vulkan loader at all. PyroWave is Vulkan compute and
+// plvk is the only Linux renderer that can share its device with it, so without a
+// loader the codec has nowhere to run and the Settings toggle would be a lie.
+// The definitive test is plvk creating a device, which logs its own reason if that
+// fails; this only keeps us from offering a mode this machine can never serve.
+bool hasVulkanLoader()
+{
+    static const char* const loaders[] = { "libvulkan.so.1", "libvulkan.so" };
+
+    for (const char* loader : loaders) {
+        void* handle = dlopen(loader, RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            continue;
+        }
+
+        // A loader without an entry point is not a loader.
+        const bool ok = dlsym(handle, "vkGetInstanceProcAddr") != nullptr;
+        // The loader is going to be loaded again by Qt and by libplacebo, and we
+        // have no reason to keep it pinned in between.
+        dlclose(handle);
+        return ok;
+    }
+
+    return false;
+}
+
+}
+#endif // Q_OS_LINUX
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -104,9 +138,18 @@ SystemProperties::SystemProperties()
     hasDiscordIntegration = false;
 #endif
 
-    // PyroWave decoding currently presents through the D3D11 renderer only
+    // PyroWave decoding is Vulkan compute. On Windows it presents through the
+    // D3D11 renderer; on Linux it presents through plvk, which shares its VkDevice
+    // with the codec (docs/pyrowave-linux-plvk.md). Either way there has to be a
+    // Vulkan loader in the picture before this can be worth offering.
 #if defined(HAVE_PYROWAVE) && defined(Q_OS_WIN32)
     hasPyroWave = true;
+#elif defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    hasPyroWave = hasVulkanLoader();
+    if (!hasPyroWave) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "PyroWave: no Vulkan loader, so the codec is not offered");
+    }
 #else
     hasPyroWave = false;
 #endif

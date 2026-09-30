@@ -315,6 +315,13 @@ PlVkRenderer::~PlVkRenderer()
             pl_tex_destroy(m_Vulkan->gpu, &m_Overlays[i].stagingOverlay.tex);
         }
 
+        // PyroWave's planes are images of this device, wrapped as pl_tex. They
+        // have to go before the device does, because releasing a wrapper means
+        // handing the image back to the pool that allocated it.
+#ifdef HAVE_PYROWAVE
+        m_PyroWaveSurfaces.reset();
+#endif
+
         for (int i = 0; i < (int)SDL_arraysize(m_Textures); i++) {
             pl_tex_destroy(m_Vulkan->gpu, &m_Textures[i]);
         }
@@ -825,6 +832,22 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     }
 #endif
 
+#ifdef HAVE_PYROWAVE
+    if (isPyroWave()) {
+        // The codec decodes into these planes on this very device, so unlike every
+        // other format here, FFmpeg is not involved in getting pixels to us at all.
+        m_PyroWaveSurfaces = std::make_unique<PlVkPyroWaveSurfaces>();
+        if (!m_PyroWaveSurfaces->initialize(m_Vulkan, m_PlVkInstance, params->width, params->height,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_YUV444) != 0,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: could not create the surfaces to decode into");
+            m_PyroWaveSurfaces.reset();
+            return false;
+        }
+    }
+#endif
+
     return true;
 }
 
@@ -1056,13 +1079,23 @@ bool PlVkRenderer::mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFra
     else
 #endif
     {
-        pl_avframe_params mapParams = {};
-        mapParams.frame = frame;
-        mapParams.tex = textures ? textures : m_Textures;
-        if (!pl_map_avframe_ex(m_Vulkan->gpu, mappedFrame, &mapParams)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "pl_map_avframe_ex() failed");
-            return false;
+#ifdef HAVE_PYROWAVE
+        if (PyroWaveFrameRef* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+            if (!mapPyroWaveFrame(frame, pyroWaveRef, mappedFrame)) {
+                return false;
+            }
+        }
+        else
+#endif
+        {
+            pl_avframe_params mapParams = {};
+            mapParams.frame = frame;
+            mapParams.tex = textures ? textures : m_Textures;
+            if (!pl_map_avframe_ex(m_Vulkan->gpu, mappedFrame, &mapParams)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "pl_map_avframe_ex() failed");
+                return false;
+            }
         }
     }
 
@@ -1101,12 +1134,23 @@ void PlVkRenderer::unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappe
     Q_UNUSED(frame)
 #endif
     {
+#ifdef HAVE_PYROWAVE
+        // A PyroWave frame was never mapped by pl_map_avframe_ex(): its planes are
+        // pre-existing images, and the codec gets them back through the pool once
+        // this thread's rendering has been submitted.
+        if (PyroWaveFrameRef::fromFrame(frame) != nullptr) {
+            return;
+        }
+#endif
         pl_unmap_avframe(m_Vulkan->gpu, mappedFrame);
     }
 }
 
 bool PlVkRenderer::populateQueues(int videoFormat)
 {
+#ifdef HAVE_PYROWAVE
+    m_VideoFormat = videoFormat;
+#endif
     auto vkDeviceContext = (AVVulkanDeviceContext*)((AVHWDeviceContext *)m_HwDeviceCtx->data)->hwctx;
 
     uint32_t queueFamilyCount = 0;
@@ -1437,6 +1481,26 @@ void PlVkRenderer::gpuRenderInfo(void* opaque, const pl_render_info* info)
 
 uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
 {
+#ifdef HAVE_PYROWAVE
+    if (PyroWaveFrameRef* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        if (m_PyroWaveSurfaces == nullptr) {
+            return 0;
+        }
+
+        const uint64_t startUs = LiGetMicroseconds();
+        // 40 ms is several frames of this panel: generous next to a decode that is
+        // usually a fraction of a millisecond, short enough that a codec which
+        // stopped making progress cannot hold the presenter hostage.
+        if (!m_PyroWaveSurfaces->waitForDecodeCpu(pyroWaveRef, 40 * 1000 * 1000)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: decode did not finish (target=%llu elapsed_us=%llu)",
+                         (unsigned long long)pyroWaveRef->decodeFenceValue,
+                         (unsigned long long)(LiGetMicroseconds() - startUs));
+            return 0; // Failure must never advertise GPU readiness
+        }
+        return LiGetMicroseconds() - startUs;
+    }
+#endif
 #ifdef HAVE_LIBVA
     if (frame == nullptr || frame->format != AV_PIX_FMT_VAAPI ||
             frame->hw_frames_ctx == nullptr) {
@@ -2205,6 +2269,11 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     const bool submitted = submitPendingSwapchainFrame();
+#ifdef HAVE_PYROWAVE
+    if (submitted) {
+        releasePyroWaveSurface();
+    }
+#endif
     if (m_GpuTrace) m_GpuTrace->record({"present", m_GpuTracePts, m_GpuTraceOutputUs,
         submissionTimeUs, LiGetMicroseconds(), presentationId, submitted});
 #ifdef Q_OS_LINUX
@@ -2293,6 +2362,13 @@ bool PlVkRenderer::cancelVrrFrame()
 #endif
 
     const bool submitted = submitPendingSwapchainFrame();
+#ifdef HAVE_PYROWAVE
+    // Even a frame whose presentation is abandoned was drawn, so its planes are
+    // owed a release signal either way.
+    if (submitted) {
+        releasePyroWaveSurface();
+    }
+#endif
 #ifdef Q_OS_LINUX
     retireCompletedVrrSourceFrames();
 #endif
@@ -2579,8 +2655,78 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 
 UnmapExit:
 
+#ifdef HAVE_PYROWAVE
+    // The reads of this frame are in the queue now, so the signal that lets the
+    // codec overwrite its planes can go behind them.
+    releasePyroWaveSurface();
+#endif
+
     unmapAvFrameFromPlacebo(frame, &mappedFrame);
 }
+
+#ifdef HAVE_PYROWAVE
+
+bool PlVkRenderer::mapPyroWaveFrame(const AVFrame* frame, PyroWaveFrameRef* ref, pl_frame* mappedFrame)
+{
+    const std::array<pl_tex, 3>* textures =
+            m_PyroWaveSurfaces ? m_PyroWaveSurfaces->planeTextures(ref->surface) : nullptr;
+    if (textures == nullptr) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: frame references unknown surface %d", ref->surface);
+        return false;
+    }
+
+    // The planes become libplacebo's to read, with a GPU wait behind them for the
+    // decode that wrote them.
+    m_PyroWaveSurfaces->handToRenderer(ref);
+    m_PyroWaveRenderedFrame = ref;
+
+    // The colour, crop and plane semantics come from the frame itself; the codec
+    // set them when it filled it in. What it cannot know about is where the pixels
+    // live, so that is all this function adds.
+    pl_frame_from_avframe(mappedFrame, frame);
+    for (int i = 0; i < mappedFrame->num_planes && i < 3; i++) {
+        mappedFrame->planes[i].texture = (*textures)[i];
+    }
+
+    if (mappedFrame->num_planes != 3) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: a %s frame mapped to %d planes instead of 3",
+                     av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)),
+                     mappedFrame->num_planes);
+        return false;
+    }
+
+    return true;
+}
+
+void PlVkRenderer::releasePyroWaveSurface()
+{
+    if (m_PyroWaveRenderedFrame == nullptr) {
+        return;
+    }
+
+    if (m_PyroWaveSurfaces == nullptr || !m_PyroWaveSurfaces->takeFromRenderer(m_PyroWaveRenderedFrame)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: could not hand surface %d back to the decoder", m_PyroWaveRenderedFrame->surface);
+        queueRenderDeviceReset();
+    }
+    m_PyroWaveRenderedFrame = nullptr;
+}
+
+IPyroWaveSurfacePool* PlVkRenderer::getPyroWaveSurfacePool()
+{
+    return m_PyroWaveSurfaces.get();
+}
+
+#else
+
+IPyroWaveSurfacePool* PlVkRenderer::getPyroWaveSurfacePool()
+{
+    return nullptr;
+}
+
+#endif // HAVE_PYROWAVE
 
 bool PlVkRenderer::testRenderFrame(AVFrame *frame)
 {

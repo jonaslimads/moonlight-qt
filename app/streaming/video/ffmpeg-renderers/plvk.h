@@ -12,6 +12,10 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
 #include "overlaycompletion.h"
+
+#ifdef HAVE_PYROWAVE
+#include "plvkpyrowave.h"
+#endif
 #include "diagnostics/gputrace.h"
 
 #include <atomic>
@@ -91,6 +95,8 @@ public:
     virtual int getDecoderColorspace() override;
     virtual int getDecoderColorRange() override;
     virtual int getDecoderCapabilities() override;
+    virtual IPyroWaveSurfacePool* getPyroWaveSurfacePool() override;
+
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
 
@@ -130,6 +136,16 @@ private:
                             pl_tex* textures = nullptr);
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
+
+#ifdef HAVE_PYROWAVE
+    // PyroWave decodes into planes on this renderer's own VkDevice. See
+    // plvkpyrowave.h and docs/pyrowave-linux-plvk.md.
+    bool isPyroWave() const { return (m_VideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
+    bool mapPyroWaveFrame(const AVFrame* frame, PyroWaveFrameRef* ref, pl_frame* mappedFrame);
+    // Hands the planes of the previously rendered frame back to the codec. Only
+    // correct after the submit that carried that frame's reads.
+    void releasePyroWaveSurface();
+#endif
     bool chooseVulkanDevice(PDECODER_PARAMETERS params, bool hdrOutputRequired);
     bool tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDeviceProperties* deviceProps,
                              PDECODER_PARAMETERS decoderParams, bool hdrOutputRequired);
@@ -165,6 +181,17 @@ private:
     VkPresentModeKHR m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     VkPresentModeKHR m_VrrAdaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
     pl_vulkan m_Vulkan = nullptr;
+
+#ifdef HAVE_PYROWAVE
+    int m_VideoFormat = 0;
+    // Declared after m_Vulkan so that it goes away first: the pool hands out
+    // textures wrapped from images of that device, and it has to release them
+    // before libplacebo destroys it.
+    std::unique_ptr<PlVkPyroWaveSurfaces> m_PyroWaveSurfaces;
+    // The frame whose planes libplacebo is currently reading, i.e. the one that
+    // still owes the codec a release signal.
+    PyroWaveFrameRef* m_PyroWaveRenderedFrame = nullptr;
+#endif
     pl_swapchain m_Swapchain = nullptr;
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};

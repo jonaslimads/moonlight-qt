@@ -104,9 +104,15 @@ struct PyroWaveDecoder::Impl {
 
     pyrowave_device device = nullptr;
     pyrowave_decoder decoder = nullptr;
+    // Only the ExternalHandles model wraps OS fences in pyrowave_sync_objects; a
+    // shared device hands over plain VkSemaphores instead (see pyrowavesurfaces.h).
     pyrowave_sync_object decodeSync = nullptr;
     pyrowave_sync_object releaseSync = nullptr;
+    VkSemaphore decodeSemaphoreHandle = VK_NULL_HANDLE;
+    VkSemaphore releaseSemaphoreHandle = VK_NULL_HANDLE;
     uint64_t decodeValue = 0;
+
+    bool sharesRendererDevice = false;
 
     struct Surface {
         std::array<pyrowave_image, 3> images {};
@@ -141,6 +147,16 @@ struct PyroWaveDecoder::Impl {
         }
     }
 
+    VkSemaphore decodeSemaphore() const
+    {
+        return decodeSync != nullptr ? pyrowave_sync_object_get_semaphore(decodeSync) : decodeSemaphoreHandle;
+    }
+
+    VkSemaphore releaseSemaphore() const
+    {
+        return releaseSync != nullptr ? pyrowave_sync_object_get_semaphore(releaseSync) : releaseSemaphoreHandle;
+    }
+
     bool importFence(uintptr_t handle, pyrowave_sync_object& sync)
     {
         if (handle == 0) {
@@ -173,6 +189,10 @@ struct PyroWaveDecoder::Impl {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "PyroWave: renderer could not export surface %d", index);
             return false;
+        }
+
+        if (sharesRendererDevice) {
+            return wrapRendererSurface(index, planes);
         }
 
         Surface surface;
@@ -239,6 +259,43 @@ struct PyroWaveDecoder::Impl {
         surfaces.push_back(surface);
         return true;
     }
+
+    // The renderer allocated these planes on the device we are decoding on, so
+    // there is no handle to import and no ownership to transfer: describe the
+    // images as they are and hand the views to the codec. pyrowave_image_create()
+    // is external-memory only and is not the tool for this.
+    bool wrapRendererSurface(int index, const PyroWaveSharedPlane planes[3])
+    {
+        Surface surface;
+        for (int plane = 0; plane < 3; plane++) {
+            const PyroWaveSharedPlane& source = planes[plane];
+            if (source.handle == 0 || source.width == 0 || source.height == 0) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "PyroWave: renderer surface %d plane %d is not usable", index, plane);
+                return false;
+            }
+
+            pyrowave_image_view& view = surface.buffers.planes[plane];
+            view.image = reinterpret_cast<VkImage>(source.handle);
+            view.width = source.width;
+            view.height = source.height;
+            view.image_format = toVkFormat(source.format);
+            view.view_format = view.image_format;
+            view.mip_level = 0;
+            view.layer = 0;
+            // A single component format is the plane itself; the aspect is ignored.
+            view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
+            // The codec writes it as a storage image and the renderer reads it as a
+            // texture, which is the one layout both sides agree on without a
+            // transition. The renderer is the one that allocated the image, so it
+            // is responsible for that being true.
+            view.layout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        surfaces.push_back(surface);
+        return true;
+    }
 };
 
 PyroWaveDecoder::PyroWaveDecoder() = default;
@@ -266,27 +323,80 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     uint32_t major = 0, minor = 0, patch = 0;
     pyrowave_get_api_version(&major, &minor, &patch);
 
-    uint8_t luid[8];
-    if (!pool->pyroWaveAdapterLuid(luid)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: renderer adapter identity is unavailable");
-        return false;
-    }
+    pyrowave_result result = PYROWAVE_SUCCESS;
 
-    static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
-    pyrowave_result result = pyrowave_create_device_by_compat(
-        0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
-    if (result != PYROWAVE_SUCCESS) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: no Vulkan device for the renderer's adapter: %s",
-                     resultString(result));
-        return false;
-    }
+    if (pool->pyroWaveSharingModel() == PyroWaveSharingModel::SharedVulkanDevice) {
+        PyroWaveVulkanDevice vk = {};
+        if (!pool->pyroWaveVulkanDevice(&vk) || vk.device == VK_NULL_HANDLE) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: the renderer gave no Vulkan device to decode on");
+            return false;
+        }
+        if (!pool->pyroWaveVulkanSync(&impl->decodeSemaphoreHandle, &impl->releaseSemaphoreHandle)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: the renderer gave no timeline semaphores to sync on");
+            return false;
+        }
 
-    if (!pyrowave_device_confirm_interop_support(impl->device)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: the Vulkan driver cannot import D3D11 textures and fences");
-        return false;
+        pyrowave_device_create_queue_info queueInfo = {};
+        queueInfo.queue = vk.queue;
+        queueInfo.familyIndex = vk.queueFamily;
+        queueInfo.index = vk.queueIndex;
+
+        // Decoding and presenting share one device, which is the whole point: no
+        // external memory, no exported handles, and the decoded planes are plain
+        // images of the device that will sample them.
+        pyrowave_device_create_info deviceInfo = {};
+        deviceInfo.GetInstanceProcAddr = vk.getInstanceProcAddr;
+        deviceInfo.instance = vk.instance;
+        deviceInfo.physical_device = vk.physicalDevice;
+        deviceInfo.device = vk.device;
+        deviceInfo.instance_create_info = vk.instanceCreateInfo;
+        deviceInfo.device_create_info = vk.deviceCreateInfo;
+        deviceInfo.queue_info = vk.queue != VK_NULL_HANDLE ? &queueInfo : nullptr;
+        deviceInfo.queue_info_count = vk.queue != VK_NULL_HANDLE ? 1 : 0;
+        // The renderer submits on this same queue from its own thread, so the
+        // codec has to go through the renderer's queue lock.
+        deviceInfo.queue_lock_callback = vk.queueLock;
+        deviceInfo.queue_unlock_callback = vk.queueUnlock;
+        deviceInfo.userdata = vk.queueLockUserdata;
+
+        result = pyrowave_create_device(&deviceInfo, &impl->device);
+        if (result != PYROWAVE_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: could not share the renderer's Vulkan device: %s",
+                         resultString(result));
+            return false;
+        }
+
+        // The renderer presents on this queue and will sample the result right
+        // away, which is also the lowest latency choice for the decode itself.
+        pyrowave_device_set_queue_type(impl->device, VK_QUEUE_GRAPHICS_BIT);
+        impl->sharesRendererDevice = true;
+    }
+    else {
+        uint8_t luid[8];
+        if (!pool->pyroWaveAdapterLuid(luid)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: renderer adapter identity is unavailable");
+            return false;
+        }
+
+        static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
+        result = pyrowave_create_device_by_compat(
+            0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
+        if (result != PYROWAVE_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: no Vulkan device for the renderer's adapter: %s",
+                         resultString(result));
+            return false;
+        }
+
+        if (!pyrowave_device_confirm_interop_support(impl->device)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: the Vulkan driver cannot import D3D11 textures and fences");
+            return false;
+        }
     }
 
     pyrowave_decoder_create_info decoderInfo = {};
@@ -303,8 +413,9 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         return false;
     }
 
-    if (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
-            !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync)) {
+    if (!impl->sharesRendererDevice &&
+            (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
+             !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync))) {
         return false;
     }
 
@@ -316,13 +427,14 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "PyroWave decoder ready: %dx%d %s %d-bit, %d surfaces, API %u.%u.%u, bitstream %s%s",
+                "PyroWave decoder ready: %dx%d %s %d-bit, %d surfaces, API %u.%u.%u, bitstream %s%s%s",
                 config.width, config.height,
                 config.chroma444 ? "4:4:4" : "4:2:0",
                 config.tenBit ? 10 : 8,
                 (int)impl->surfaces.size(),
                 major, minor, patch, PYROWAVE_BITSTREAM_ID,
-                decoderInfo.fragment_path ? " (fragment path)" : "");
+                decoderInfo.fragment_path ? " (fragment path)" : "",
+                impl->sharesRendererDevice ? " (shared renderer device)" : "");
 
     m_Impl = std::move(impl);
     return true;
@@ -383,26 +495,31 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
 
     std::array<pyrowave_gpu_external_reference, 3> acquireImages;
     std::array<pyrowave_gpu_external_reference, 3> releaseImages;
-    for (int plane = 0; plane < 3; plane++) {
-        // The previous contents are overwritten, so discard them
-        acquireImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_IGNORED };
-        releaseImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_EXTERNAL };
+    if (!impl.sharesRendererDevice) {
+        for (int plane = 0; plane < 3; plane++) {
+            // The previous contents are overwritten, so discard them
+            acquireImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_IGNORED };
+            releaseImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_EXTERNAL };
+        }
     }
 
     pyrowave_gpu_sync_operation acquire = {};
-    acquire.images = acquireImages.data();
-    acquire.num_images = acquireImages.size();
+    // With a shared device there are no images to acquire: the planes already
+    // belong to this device and are already in GENERAL layout, so the only thing
+    // worth transferring is the wait itself.
+    acquire.images = impl.sharesRendererDevice ? nullptr : acquireImages.data();
+    acquire.num_images = impl.sharesRendererDevice ? 0 : acquireImages.size();
     if (releaseValue != 0) {
         // Wait on the GPU until the renderer finished its last read
-        acquire.sync.semaphore = pyrowave_sync_object_get_semaphore(impl.releaseSync);
+        acquire.sync.semaphore = impl.releaseSemaphore();
         acquire.sync.value = releaseValue;
     }
 
     const uint64_t decodeValue = impl.decodeValue + 1;
     pyrowave_gpu_sync_operation release = {};
-    release.images = releaseImages.data();
-    release.num_images = releaseImages.size();
-    release.sync.semaphore = pyrowave_sync_object_get_semaphore(impl.decodeSync);
+    release.images = impl.sharesRendererDevice ? nullptr : releaseImages.data();
+    release.num_images = impl.sharesRendererDevice ? 0 : releaseImages.size();
+    release.sync.semaphore = impl.decodeSemaphore();
     release.sync.value = decodeValue;
 
     const pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(

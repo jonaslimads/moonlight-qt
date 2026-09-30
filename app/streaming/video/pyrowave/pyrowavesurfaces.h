@@ -67,6 +67,15 @@ struct PyroWaveVulkanDevice {
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     uint32_t queueIndex = 0;
+
+    // Locks around queue submission. The renderer also submits on this queue, and
+    // libplacebo requires external users to take its queue lock, so the codec has
+    // to be told about it rather than left to vkQueueSubmit freely from the decode
+    // thread. Called with the userdata below; may be NULL only if nothing else
+    // submits on this device from another thread.
+    void (*queueLock)(void* userdata) = nullptr;
+    void (*queueUnlock)(void* userdata) = nullptr;
+    void* queueLockUserdata = nullptr;
 };
 
 class IPyroWaveSurfacePool {
@@ -91,17 +100,30 @@ public:
     virtual int pyroWaveSurfaceCount() const = 0;
 
     // Returns fresh handles for the three planes (Y, Cb, Cr) of a surface.
-    // Under ExternalHandles the caller owns them and must close them if it does
-    // not consume them; under SharedVulkanDevice they belong to the renderer.
+    // Under ExternalHandles these are OS handles the caller owns and must close
+    // if it does not consume them; under SharedVulkanDevice they are VkImages
+    // that belong to the renderer and stay valid for its whole life.
     virtual bool exportPyroWaveSurface(int index, PyroWaveSharedPlane planes[3]) = 0;
 
-    // Fresh OS handles for the shared timeline fences. The decoder signals the
-    // decode fence; the renderer signals the release fence. Only used by the
-    // ExternalHandles model: when the device is shared, the decoder creates the
-    // semaphores itself and hands them back with decodeSemaphore() and
-    // releaseSemaphore().
+    // Timeline semaphores shared across the boundary. The decoder signals the
+    // decode one when it finished writing a surface and waits on the release one
+    // before overwriting it.
+    //
+    // Under ExternalHandles they are fresh OS handles the caller owns and must
+    // close if it does not consume them, and the decoder imports them as
+    // pyrowave_sync_objects.
     virtual uintptr_t exportPyroWaveDecodeFence() = 0;
     virtual uintptr_t exportPyroWaveReleaseFence() = 0;
+
+    // Under SharedVulkanDevice the two semaphores are plain VkSemaphores of the
+    // shared device, which need no importing at all: pyrowave's sync points take
+    // a VkSemaphore and libplacebo's pl_vulkan_sem takes one too. They belong to
+    // the renderer and must outlive the decoder.
+    virtual bool pyroWaveVulkanSync(VkSemaphore* decode, VkSemaphore* release) {
+        (void)decode;
+        (void)release;
+        return false;
+    }
 };
 
 // Owned by each PyroWave AVFrame through frame->buf[0]. Freeing the last
