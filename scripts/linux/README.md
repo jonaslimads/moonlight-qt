@@ -9,6 +9,23 @@ git ignored; only these scripts are versioned.
     scripts/linux/build-moonlight.sh bootstrap    also fetch the .deb sysroot
     scripts/linux/build-moonlight.sh CONFIG+=tests   also build the test tree
     scripts/linux/run-tests.sh [filter]           run every built test binary
+    scripts/linux/install-native.sh               build, install, register with the desktop
+    scripts/linux/install-native.sh --no-build    install what is already built
+    scripts/linux/install-native.sh --no-desktop  install without touching the desktop
+
+`install-native.sh` puts everything under `~/.local/opt/moonlight-pyrowave` (a
+stable path, so the desktop entry and the dock pin keep working after a rebuild),
+writes `bin/moonlight` as a launcher that points Qt at the bundled runtime next to
+it, registers `com.moonlight_stream.Moonlight.desktop` and appends it to
+`org.gnome.shell favorite-apps` instead of replacing the list.
+
+What gets bundled is decided per library, and the interesting part is what does
+*not*: the system's ffmpeg, libplacebo, libGL and X libraries stay system
+provided, because a GPU driver or codec loaded out of a bundled tree instead of the
+system's fails as a black screen and nothing else. Qt and its icu do get bundled,
+because noble ships Qt 6.4.2 and this does not build against it, and Qt's own
+libraries have to stay internally consistent. Qt's private copies of ffmpeg and
+friends are filtered out even though `ldd` happily resolves to them.
 
 `env.sh` is sourced by the others and may be sourced by hand to get `qmake6`,
 the compiler include path and the link path on one line.
