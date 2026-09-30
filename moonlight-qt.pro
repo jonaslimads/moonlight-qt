@@ -23,6 +23,14 @@ win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
     app.depends += pyrowave
 }
 
+# The codec is Vulkan compute and builds on Linux as well, so build the library
+# there first. app/app.pro keeps the application side in step and only links it
+# once the Linux presentation path in plvk is in place.
+unix:!macx:contains(QT_ARCH, x86_64):!disable-pyrowave {
+    SUBDIRS += pyrowave
+    app.depends += pyrowave
+}
+
 # Support debug and release builds from command line for CI
 CONFIG += debug_and_release
 

@@ -37,6 +37,15 @@ unix {
     QMAKE_CXXFLAGS += -fvisibility=hidden -fvisibility-inlines-hidden
 }
 
+# Granite selects its vector math in Granite/math/simd.hpp on __SSE3__, which
+# x86-64 GCC and Clang do not define by default (their baseline is SSE2), so
+# the header falls through to its "Implement me." error. Upstream passes -msse3
+# for exactly this reason in pyrowave/CMakeLists.txt and Granite/CMakeLists.txt.
+# It only has to reach the C++ sources: simd.hpp is C++-only.
+*-g++*:contains(QT_ARCH, x86_64) {
+    QMAKE_CXXFLAGS += -msse3
+}
+
 SOURCES += \
     $$PW_DIR/pyrowave_c.cpp \
     $$PW_DIR/pyrowave_common.cpp \
