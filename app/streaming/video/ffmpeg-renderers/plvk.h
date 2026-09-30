@@ -13,7 +13,7 @@
 #include <libplacebo/vulkan.h>
 #include "overlaycompletion.h"
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
 #include "plvkpyrowave.h"
 #endif
 #include "diagnostics/gputrace.h"
@@ -137,7 +137,7 @@ private:
     void unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame);
     bool populateQueues(int videoFormat);
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     // PyroWave decodes into planes on this renderer's own VkDevice. See
     // plvkpyrowave.h and docs/pyrowave-linux-plvk.md.
     bool isPyroWave() const { return (m_VideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
@@ -182,7 +182,7 @@ private:
     VkPresentModeKHR m_VrrAdaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
     pl_vulkan m_Vulkan = nullptr;
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     int m_VideoFormat = 0;
     // Declared after m_Vulkan so that it goes away first: the pool hands out
     // textures wrapped from images of that device, and it has to release them

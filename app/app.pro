@@ -532,6 +532,10 @@ win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
 unix:!macx:contains(QT_ARCH, x86_64):libplacebo:!disable-pyrowave {
     message(PyroWave decoder enabled via plvk)
     CONFIG += pyrowave
+    # plvk is the renderer that can share a device with the codec here. Windows
+    # keeps its D3D11 pool and does not get plvk claiming PyroWave surfaces,
+    # because that would silently change a path nobody has run on Windows.
+    DEFINES += HAVE_PYROWAVE_PLVK
 }
 pyrowave {
     DEFINES += HAVE_PYROWAVE
@@ -544,7 +548,7 @@ pyrowave {
         streaming/video/pyrowave/pyrowaveframing.h \
         streaming/video/pyrowave/pyrowavesurfaces.h
 
-    libplacebo {
+    unix:!macx:libplacebo {
         SOURCES += streaming/video/ffmpeg-renderers/plvkpyrowave.cpp
         HEADERS += streaming/video/ffmpeg-renderers/plvkpyrowave.h
     }

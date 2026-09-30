@@ -318,7 +318,7 @@ PlVkRenderer::~PlVkRenderer()
         // PyroWave's planes are images of this device, wrapped as pl_tex. They
         // have to go before the device does, because releasing a wrapper means
         // handing the image back to the pool that allocated it.
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
         m_PyroWaveSurfaces.reset();
 #endif
 
@@ -832,7 +832,7 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     }
 #endif
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     if (isPyroWave()) {
         // The codec decodes into these planes on this very device, so unlike every
         // other format here, FFmpeg is not involved in getting pixels to us at all.
@@ -1079,7 +1079,7 @@ bool PlVkRenderer::mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFra
     else
 #endif
     {
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
         if (PyroWaveFrameRef* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
             if (!mapPyroWaveFrame(frame, pyroWaveRef, mappedFrame)) {
                 return false;
@@ -1134,7 +1134,7 @@ void PlVkRenderer::unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappe
     Q_UNUSED(frame)
 #endif
     {
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
         // A PyroWave frame was never mapped by pl_map_avframe_ex(): its planes are
         // pre-existing images, and the codec gets them back through the pool once
         // this thread's rendering has been submitted.
@@ -1148,7 +1148,7 @@ void PlVkRenderer::unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappe
 
 bool PlVkRenderer::populateQueues(int videoFormat)
 {
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     m_VideoFormat = videoFormat;
 #endif
     auto vkDeviceContext = (AVVulkanDeviceContext*)((AVHWDeviceContext *)m_HwDeviceCtx->data)->hwctx;
@@ -1481,7 +1481,7 @@ void PlVkRenderer::gpuRenderInfo(void* opaque, const pl_render_info* info)
 
 uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
 {
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     if (PyroWaveFrameRef* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
         if (m_PyroWaveSurfaces == nullptr) {
             return 0;
@@ -2269,7 +2269,7 @@ VrrPresentFeedback PlVkRenderer::presentAdaptive(const VrrPresentRequest& reques
     }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
     const bool submitted = submitPendingSwapchainFrame();
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     if (submitted) {
         releasePyroWaveSurface();
     }
@@ -2362,7 +2362,7 @@ bool PlVkRenderer::cancelVrrFrame()
 #endif
 
     const bool submitted = submitPendingSwapchainFrame();
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     // Even a frame whose presentation is abandoned was drawn, so its planes are
     // owed a release signal either way.
     if (submitted) {
@@ -2655,7 +2655,7 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
 
 UnmapExit:
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
     // The reads of this frame are in the queue now, so the signal that lets the
     // codec overwrite its planes can go behind them.
     releasePyroWaveSurface();
@@ -2664,7 +2664,7 @@ UnmapExit:
     unmapAvFrameFromPlacebo(frame, &mappedFrame);
 }
 
-#ifdef HAVE_PYROWAVE
+#ifdef HAVE_PYROWAVE_PLVK
 
 bool PlVkRenderer::mapPyroWaveFrame(const AVFrame* frame, PyroWaveFrameRef* ref, pl_frame* mappedFrame)
 {
@@ -2726,7 +2726,7 @@ IPyroWaveSurfacePool* PlVkRenderer::getPyroWaveSurfacePool()
     return nullptr;
 }
 
-#endif // HAVE_PYROWAVE
+#endif // HAVE_PYROWAVE_PLVK
 
 bool PlVkRenderer::testRenderFrame(AVFrame *frame)
 {

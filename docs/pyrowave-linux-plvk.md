@@ -156,6 +156,16 @@ timings are not a benchmark: the CPU-side PSNR work dominates them.
 sanity probe, and the decoder must fall back to a non-PyroWave path rather than
 kill the session if it fails.
 
+## Windows stays as it was
+
+The plvk pool is compiled and referenced only when qmake defines
+`HAVE_PYROWAVE_PLVK`, which happens on the Linux gate. `HAVE_PYROWAVE` on its own -
+Windows - leaves `PlVkRenderer::getPyroWaveSurfacePool()` returning null, exactly as
+before, so Windows keeps choosing the D3D11 pool and plvk there never claims it can
+display PyroWave. Letting plvk claim it on Windows would have been a plausible
+improvement and an untested one, and the Windows build is the thing that says
+whether a codec change broke anything.
+
 ## Build gates
 
 * `pyrowave/pyrowave.pri` needs `-msse3` for x86-64 GCC/Clang: Granite picks its
